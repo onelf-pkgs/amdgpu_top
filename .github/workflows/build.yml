@@ -11,7 +11,6 @@ on:
   workflow_dispatch:
 
 env:
-  # -- Change these per package --
   UPSTREAM_REPO: Umio-Yasuno/amdgpu_top
   BUILD_CONTAINER: debian:trixie-slim
   PKG_NAME: amdgpu_top
@@ -31,12 +30,11 @@ jobs:
       - name: Check for new version
         id: check
         run: |
-          RELEASE=$(curl -sL "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
-          TAG=$(echo "$RELEASE" | jq -r '.tag_name // empty')
+          TAG=$(curl -sL "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+                | jq -r '.tag_name // empty')
           VERSION="${TAG#v}"
 
           if [ -z "$VERSION" ]; then
-            echo "No upstream release found"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -66,47 +64,45 @@ jobs:
         arch:
           - name: x86_64
             runner: ubuntu-latest
-            asset_pattern: "amdgpu-top_.*_amd64\\.deb"
+            asset_glob: "amdgpu-top_[0-9]*_amd64.deb"
             onelf_asset: onelf-x86_64-linux
+            zsyncmake_asset: zsyncmake-x86_64-linux
           - name: aarch64
             runner: ubuntu-24.04-arm
-            asset_pattern: "amdgpu-top_.*_arm64\\.deb"
+            asset_glob: "amdgpu-top_[0-9]*_arm64.deb"
             onelf_asset: onelf-aarch64-linux
+            zsyncmake_asset: zsyncmake-aarch64-linux
     steps:
       - name: Install tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq curl jq file
+          apt-get install -y -qq curl file jq binutils
 
       - uses: actions/checkout@v4
 
-      - name: Install onelf + zsyncmake
+      - name: Install soar + onelf + zsyncmake
         run: |
-          ARCH="${{ matrix.arch.name }}"
+          # soar
+          curl -sL "https://github.com/pkgforge/soar/releases/latest/download/soar-${{ matrix.arch.name }}-linux" -o /usr/local/bin/soar
+          chmod +x /usr/local/bin/soar
+
           # onelf
-          URL=$(curl -sL https://api.github.com/repos/QaidVoid/onelf/releases/latest \
-                | jq -r --arg name "${{ matrix.arch.onelf_asset }}" \
-                  '.assets[] | select(.name == $name) | .browser_download_url')
-          curl -sL -o /usr/local/bin/onelf "$URL"
+          soar dl --github QaidVoid/onelf \
+            -g "${{ matrix.arch.onelf_asset }}" \
+            -o /usr/local/bin/onelf -q
           chmod +x /usr/local/bin/onelf
-          # zsyncmake (from zsync-rs)
-          URL=$(curl -sL https://api.github.com/repos/QaidVoid/zsync-rs/releases/latest \
-                | jq -r --arg name "zsyncmake-${ARCH}-linux" \
-                  '.assets[] | select(.name == $name) | .browser_download_url')
-          curl -sL -o /usr/local/bin/zsyncmake "$URL"
+
+          # zsyncmake
+          soar dl --github QaidVoid/zsync-rs \
+            -g "${{ matrix.arch.zsyncmake_asset }}" \
+            -o /usr/local/bin/zsyncmake -q
           chmod +x /usr/local/bin/zsyncmake
 
       - name: Fetch upstream asset
         run: |
-          RELEASE=$(curl -sL "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
-          ASSET_URL=$(echo "$RELEASE" | jq -r \
-            --arg pat "${{ matrix.arch.asset_pattern }}" \
-            '[.assets[] | select(.name | test($pat))] | first | .browser_download_url // empty')
-          if [ -z "$ASSET_URL" ]; then
-            echo "No asset matching ${{ matrix.arch.asset_pattern }}"
-            exit 1
-          fi
-          curl -sL -o /tmp/upstream-asset "$ASSET_URL"
+          soar dl --github "${UPSTREAM_REPO}" \
+            -g "${{ matrix.arch.asset_glob }}" \
+            -o /tmp/upstream-asset -q
 
       - name: Build
         run: |
@@ -130,31 +126,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
 
-      - name: Rename artifacts per arch
+      - name: Collect and rename artifacts
         run: |
           shopt -s nullglob
-          for f in **/*.onelf; do
-            dir=$(dirname "$f")
-            base=$(basename "$f" .onelf)
-            case "$dir" in
-              *x86_64*|*amd64*) arch="x86_64" ;;
-              *aarch64*|*arm64*) arch="aarch64" ;;
-              *) arch="unknown" ;;
-            esac
-            mv "$f" "${base}-${arch}.onelf"
-            # Move matching zsync if present
-            zsync="${f}.zsync"
-            [ -f "$zsync" ] && mv "$zsync" "${base}-${arch}.onelf.zsync"
+          mkdir -p release
+          for dir in ${PKG_NAME}-*/; do
+            # Artifact dir name is <PKG_NAME>-<arch>
+            arch="${dir#${PKG_NAME}-}"
+            arch="${arch%/}"
+            for f in "$dir"**/*.onelf; do
+              mv "$f" "release/${PKG_NAME}-${arch}.onelf"
+            done
+            for f in "$dir"**/*.zsync; do
+              mv "$f" "release/${PKG_NAME}-${arch}.onelf.zsync"
+            done
           done
-          ls -lh *.onelf *.zsync 2>/dev/null || true
+          ls -lh release/ 2>/dev/null || true
 
       - name: Create release
         run: |
           shopt -s nullglob
-          FILES=(*.onelf *.zsync)
+          FILES=(release/*)
           if [ ${#FILES[@]} -eq 0 ]; then
             echo "No artifacts found"
             exit 1
